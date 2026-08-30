@@ -21,8 +21,11 @@ from pathlib import Path
 from datetime import datetime
 
 import httpx
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, File, Form, HTTPException, UploadFile
 from fastapi.responses import JSONResponse
+from models import GenerateComponentResponse, SavedFiles
+from Openai_Client import OpenAIError, generate_component_from_image
+
 from pydantic import BaseModel, Field
 from dotenv import load_dotenv
 load_dotenv()  # Load environment variables from .env file
@@ -34,6 +37,8 @@ THIRD_PARTY_API_URL = os.getenv("THIRD_PARTY_API_URL", "https://api.openai.com/v
 THIRD_PARTY_API_KEY = os.getenv("THIRD_PARTY_API_KEY", "")
 OUTPUT_DIR = Path(os.getenv("HTML_OUTPUT_DIR", "./generated_html"))
 REQUEST_TIMEOUT = 60.0  # seconds
+MAX_IMAGE_BYTES = 8 * 1024 * 1024  # 8 MB
+ALLOWED_CONTENT_TYPES = {"image/png", "image/jpeg", "image/webp", "image/gif"}
 
 OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 
@@ -164,6 +169,95 @@ async def generate_html(payload: GenerateHtmlRequest):
         created_at=datetime.utcnow().isoformat(),
     )
 
+def _resolve_safe_output_dir(download_path: str | None) -> Path:
+    """Resolves the caller-supplied download_path against OUTPUT_BASE_DIR and
+    guarantees the result stays inside it (blocks '..' traversal / absolute
+    path escapes)."""
+    download_path = (download_path or "").strip()
+    candidate = (OUTPUT_DIR / download_path).resolve() if download_path else OUTPUT_DIR
+ 
+    try:
+        candidate.relative_to(OUTPUT_DIR)
+    except ValueError:
+        raise HTTPException(
+            status_code=400,
+            detail=f"download_path must resolve inside the output base directory ({OUTPUT_DIR})",
+        )
+    return candidate
+ 
+ 
+def _validate_component_name(component_name: str) -> str:
+    name = component_name.strip()
+    if not name or not name[0].isalpha() or not name.replace("_", "").isalnum():
+        raise HTTPException(
+            status_code=400,
+            detail="component_name must be a valid identifier, e.g. 'PricingCard' (letters/digits/underscore, starting with a letter)",
+        )
+    return name
+ 
+ 
+async def _read_and_validate_image(image: UploadFile) -> bytes:
+    if image.content_type not in ALLOWED_CONTENT_TYPES:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Unsupported content type '{image.content_type}'. Allowed: {sorted(ALLOWED_CONTENT_TYPES)}",
+        )
+    image_bytes = await image.read()
+    if not image_bytes:
+        raise HTTPException(status_code=400, detail="Uploaded image is empty")
+    if len(image_bytes) > MAX_IMAGE_BYTES:
+        raise HTTPException(status_code=400, detail="Image exceeds 8 MB limit")
+    return image_bytes
+ 
+ 
+@app.post("/api/generate-component", response_model=SavedFiles)
+async def generate_component(
+    image: UploadFile = File(..., description="Screenshot or mockup of the UI to replicate"),
+    component_name: str = Form(..., description="Desired component name, e.g. 'PricingCard'"),
+    download_path: str = Form(
+        "", description="Sub-folder (relative to the server's output base dir) to save the files into"
+    ),
+    instructions: str | None = Form(None, description="Optional extra instructions for the model"),
+):
+    """
+    Generates a React component + CSS + unit test from an image and writes
+    them to disk as:
+        {OUTPUT_BASE_DIR}/{download_path}/{component_name}.jsx
+        {OUTPUT_BASE_DIR}/{download_path}/{component_name}.css
+        {OUTPUT_BASE_DIR}/{download_path}/{component_name}.test.jsx
+    """
+    name = _validate_component_name(component_name)
+    target_dir = _resolve_safe_output_dir(download_path)
+    image_bytes = await _read_and_validate_image(image)
+ 
+    try:
+        bundle, usage = await generate_component_from_image(
+            image_bytes=image_bytes,
+            content_type=image.content_type,
+            extra_instructions=instructions,
+            desired_component_name=name,
+            model=os.environ.get("OPENAI_MODEL", "gpt-4o-mini"),
+        )
+    except OpenAIError as exc:
+        raise HTTPException(status_code=502, detail=str(exc)) from exc
+ 
+    target_dir.mkdir(parents=True, exist_ok=True)
+ 
+    jsx_path = target_dir / f"{name}.jsx"
+    css_path = target_dir / f"{name}.css"
+    test_path = target_dir / f"{name}.test.jsx"
+ 
+    jsx_path.write_text(bundle.component_code, encoding="utf-8")
+    css_path.write_text(bundle.css_code, encoding="utf-8")
+    test_path.write_text(bundle.test_code, encoding="utf-8")
+ 
+    return SavedFiles(
+        component_name=name,
+        component_path=str(jsx_path),
+        css_path=str(css_path),
+        test_path=str(test_path),
+        usage=usage,
+    )
 
 @app.get("/health")
 async def health():
